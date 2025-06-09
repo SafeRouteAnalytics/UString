@@ -219,121 +219,137 @@ def load_checkpoint(model, optimizer=None, filename='checkpoint.pth.tar', isTrai
     return model, optimizer, start_epoch
 
 
-def train_eval(traindata_loader, testdata_loader):
-    ### --- CONFIG PATH ---
-    # data_path = os.path.join(ROOT_PATH, p.data_path, p.dataset)
+# def train_eval(traindata_loader, testdata_loader): # Old signature
+def train_eval(traindata_loader, testdata_loader, current_fold_num): # New signature
     data_path = p.data_path
-    # model snapshots
-    model_dir = os.path.join(p.output_dir, p.dataset, 'snapshot')
+    
+    # Create fold-specific directory names
+    fold_snapshot_dirname = f"fold_{current_fold_num}_snapshot"
+    fold_logs_dirname = f"fold_{current_fold_num}_logs"
+
+    # model snapshots (fold-specific)
+    model_dir = os.path.join(p.output_dir, p.dataset, fold_snapshot_dirname)
     if not os.path.exists(model_dir):
         os.makedirs(model_dir)
-    # tensorboard logging
-    logs_dir = os.path.join(p.output_dir, p.dataset, 'logs')
+    # tensorboard logging (fold-specific)
+    logs_dir = os.path.join(p.output_dir, p.dataset, fold_logs_dirname)
     if not os.path.exists(logs_dir):
         os.makedirs(logs_dir)
     logger = SummaryWriter(logs_dir)
 
-    # gpu options
-    # gpu_ids = [int(id) for id in p.gpus.split(',')]
-    # print("Using GPU devices: ", gpu_ids)
-    # os.environ['CUDA_VISIBLE_DEVICES'] = p.gpus
-    # device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    # Determine n_obj from the dataset
+    # train_subset.dataset refers to the original full_dataset (DADDatasetCV instance)
+    n_obj_val = 19 # Default
+    if hasattr(traindata_loader.dataset.dataset, 'n_obj'):
+        n_obj_val = traindata_loader.dataset.dataset.n_obj
+    else:
+        print(f"Warning: 'n_obj' attribute not found in dataset. Using default value: {n_obj_val}")
 
-    # # create data loader
-    # # if p.dataset == 'dad':
-
-    # train_data = DADDataset(data_path, 'training', toTensor=True, device=device, n_frames=p.n_frames, fps=p.fps, toa=p.toa)
-    # test_data = DADDataset(data_path, 'testing', toTensor=True, device=device, n_frames=p.n_frames, fps=p.fps, toa=p.toa)
-
-    # elif p.dataset == 'a3d':
-    #     from src.DataLoader import A3DDataset
-    #     train_data = A3DDataset(data_path, p.feature_name, 'train', toTensor=True, device=device)
-    #     test_data = A3DDataset(data_path, p.feature_name, 'test', toTensor=True, device=device)
-    # elif p.dataset == 'crash':
-    #     from src.DataLoader import CrashDataset
-    #     train_data = CrashDataset(data_path, p.feature_name, 'train', toTensor=True, device=device)
-    #     test_data = CrashDataset(data_path, p.feature_name, 'test', toTensor=True, device=device)
-    # else:
-    #     raise NotImplementedError
-
-    # traindata_loader = DataLoader(dataset=train_data, batch_size=p.batch_size, shuffle=True, drop_last=True)
-    # testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True)
-    
-    # building model
+    # building model (re-initialized for each fold)
     model = UString(feature_dim, p.hidden_dim, p.latent_dim, 
-                       n_layers=p.num_rnn, n_obj=19, n_frames=p.n_frames, fps=p.fps, 
+                       n_layers=p.num_rnn, n_obj=n_obj_val, n_frames=p.n_frames, fps=p.fps, 
                        with_saa=True, uncertain_ranking=True)
 
-    # optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=p.base_lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
-    if len(gpu_ids) > 1:
+    if len(gpu_ids) > 1: # gpu_ids is global
         model = torch.nn.DataParallel(model)
-    model = model.to(device=device)
-    model.train() # set the model into training status
-
-    # resume training 
+    model = model.to(device=device) # device is global
+    
     start_epoch = -1
+    # Resume logic needs to be fold-aware if used.
+    # e.g., p.model_file could point to a specific fold's checkpoint.
     if p.resume:
-        model, optimizer, start_epoch = load_checkpoint(model, optimizer=optimizer, filename=p.model_file)
+        # Construct path to specific fold's model if resuming a fold, e.g. by looking for 'best_model.pth' in model_dir
+        # For simplicity, this example uses the global p.model_file.
+        # User might need to set p.model_file appropriately if resuming a specific fold.
+        if os.path.isfile(p.model_file):
+            model, optimizer, start_epoch = load_checkpoint(model, optimizer=optimizer, filename=p.model_file)
+            # Consider also restoring iter_cur if saved in checkpoint
+        else:
+            print(f"Resume specified, but checkpoint '{p.model_file}' not found. Starting fold {current_fold_num} from scratch.")
 
-    # write histograms
-    write_weight_histograms(logger, model, 0)
-    iter_cur = 0
-    best_metric = 0
+
+    # Pass model.module to histogram writer if DataParallel is used
+    model_for_histograms = model.module if isinstance(model, torch.nn.DataParallel) else model
+    write_weight_histograms(logger, model_for_histograms, 0)
+    
+    iter_cur = 0 # Reset for each fold
+    best_metric = 0.0 # Reset best AP for each fold
+
+    # *** THIS IS THE PRIMARY FIX FOR THE ERROR ***
+    # Initialize metrics with default values to ensure it's always defined.
+    current_eval_metrics = {'AP': -1.0, 'mTTA': -1.0, 'TTA_R80': -1.0}
+
     for k in range(p.epoch):
-        if k <= start_epoch:
+        if k <= start_epoch: # Handles resuming from a specific epoch
             iter_cur += len(traindata_loader)
             continue
+        
+        model.train() # Set model to training mode
         for i, (batch_xs, batch_ys, graph_edges, edge_weights, batch_toas) in enumerate(traindata_loader):
-            # ipdb.set_trace()
             optimizer.zero_grad()
             losses, all_outputs, hidden_st = model(batch_xs, batch_ys, batch_toas, graph_edges, edge_weights=edge_weights, npass=2, nbatch=len(traindata_loader), eval_uncertain=True)
             complexity_loss = losses['log_posterior'] - losses['log_prior']
             losses['total_loss'] = p.loss_alpha * complexity_loss + losses['cross_entropy']
             losses['total_loss'] += p.loss_beta * losses['auxloss']
             losses['total_loss'] += p.loss_yita * losses['ranking']
-            # backward
+            
             losses['total_loss'].mean().backward()
-            # clip gradients
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
             optimizer.step()
-            # write the losses info
+            
             lr = optimizer.param_groups[0]['lr']
-            write_scalars(logger, k, iter_cur, losses, lr)
+            write_scalars(logger, k, iter_cur, losses, lr) # iter_cur is the global step counter for logging
             
             iter_cur += 1
-            # test and evaluate the model
             if iter_cur % p.test_iter == 0:
                 model.eval()
-                all_pred, all_labels, all_toas, losses_all = test_all(testdata_loader, model)
-                model.train()
-                loss_val = average_losses(losses_all)
+                all_pred, all_labels, all_toas, losses_all_eval = test_all(testdata_loader, model)
+                model.train() # Switch back to train mode
+                
+                loss_val = average_losses(losses_all_eval)
                 print('----------------------------------')
-                print("Starting evaluation...")
-                metrics = {}
-                metrics['AP'], metrics['mTTA'], metrics['TTA_R80'] = evaluation(all_pred, all_labels, all_toas, fps=p.fps)
+                print(f"Fold {current_fold_num} - Evaluation at Epoch {k}, Iteration {iter_cur}")
+                
+                # current_eval_metrics is updated here with new results
+                current_eval_metrics = {} 
+                current_eval_metrics['AP'], current_eval_metrics['mTTA'], current_eval_metrics['TTA_R80'] = evaluation(all_pred, all_labels, all_toas, fps=p.fps)
                 print('----------------------------------')
-                # keep track of validation losses
-                write_test_scalars(logger, k, iter_cur, loss_val, metrics)
+                write_test_scalars(logger, k, iter_cur, loss_val, current_eval_metrics)
 
-        # save model
-        model_file = os.path.join(model_dir, 'bayesian_gcrnn_model_%02d.pth'%(k))
-        torch.save({'epoch': k,
-                    'model': model.module.state_dict() if len(gpu_ids)>1 else model.state_dict(),
-                    'optimizer': optimizer.state_dict()}, model_file)
-        if metrics['AP'] > best_metric:
-            best_metric = metrics['AP']
-            # update best model file
-            update_final_model(model_file, os.path.join(model_dir, 'final_model.pth'))
-        print('Model has been saved as: %s'%(model_file))
+        # End of epoch k
+        # Save model checkpoint (fold-specific path, epoch-specific name)
+        # model_file name now includes epoch, path is already fold-specific
+        model_file_epoch = os.path.join(model_dir, f'bayesian_gcrnn_model_epoch_{k:02d}.pth')
+        torch.save({
+            'epoch': k,
+            'model': model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'iter_cur': iter_cur, # Save iter_cur for potential resume
+            'best_metric_for_fold': best_metric # Save current best metric for this fold for info
+        }, model_file_epoch)
+        
+        # current_eval_metrics['AP'] will hold the AP from the latest evaluation in this epoch,
+        # or -1.0 if no evaluation occurred in this epoch (or ever in this fold's training).
+        if current_eval_metrics['AP'] > best_metric:
+            best_metric = current_eval_metrics['AP']
+            # Update best model file for the current fold
+            best_model_path = os.path.join(model_dir, 'best_model_for_fold.pth') # Consistent name for best model of this fold
+            update_final_model(model_file_epoch, best_model_path)
+            print(f'Fold {current_fold_num} - Epoch {k}: New best AP: {best_metric:.4f}. Best model updated: {best_model_path}')
+        else:
+            print(f'Fold {current_fold_num} - Epoch {k}: Model saved: {model_file_epoch}. AP: {current_eval_metrics["AP"]:.4f} (Best for fold: {best_metric:.4f})')
 
-        scheduler.step(losses['log_posterior'])
-        # write histograms
-        write_weight_histograms(logger, model, k+1)
+        # Step the scheduler, ensure the metric is scalar.
+        # losses['log_posterior'] is likely a tensor; use .mean() if scheduler expects scalar.
+        scheduler.step(losses['log_posterior'].mean()) 
+        
+        model_for_histograms = model.module if isinstance(model, torch.nn.DataParallel) else model
+        write_weight_histograms(logger, model_for_histograms, k + 1)
 
-        metrics_arr.append(best_metric)
+    metrics_arr.append(best_metric) # Add the best AP achieved in this fold to the global list
     logger.close()
 
 
@@ -466,7 +482,7 @@ if __name__ == '__main__':
                         help='The number of RNN cells for each timestamp. Default: 1')
     parser.add_argument('--feature_name', type=str, default='vgg16', choices=['vgg16', 'res101'],
                         help='The name of feature embedding methods. Default: vgg16')
-    parser.add_argument('--test_iter', type=int, default=100,
+    parser.add_argument('--test_iter', type=int, default=64,
                         help='The number of iteration to perform a evaluation process. Default: 64')
     parser.add_argument('--hidden_dim', type=int, default=256,
                         help='The dimension of hidden states in RNN. Default: 256')
@@ -492,7 +508,8 @@ if __name__ == '__main__':
                         help='The trained GCRNN model file for demo test only.')
     parser.add_argument('--output_dir', type=str, default='./output_debug/bayes_gcrnn/vgg16',
                         help='The directory of src need to save in the training.')
-
+    parser = argparse.ArgumentParser()
+    # ... (all your argparse definitions) ...
     p = parser.parse_args()
     
     # gpu options
@@ -501,23 +518,32 @@ if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = p.gpus
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-    dataset = DADDatasetCV(p.data_path, 'training', toTensor=True, device=device, n_frames=p.n_frames, fps=p.fps, toa=p.toa)
+    # Load the full dataset once for K-Fold splitting
+    # Ensure DADDatasetCV is designed to load all necessary data for splitting
+    full_dataset = DADDatasetCV(p.data_path, 'training', toTensor=True, device=device, n_frames=p.n_frames, fps=p.fps, toa=p.toa)
 
     folds = p.n_folds
-    kf = KFold(n_splits=folds, shuffle=True, random_state=42)
+    kf = KFold(n_splits=folds, shuffle=True, random_state=seed) # Use defined seed for KFold
 
-    for fold, (train_idx, test_idx) in enumerate(kf.split(dataset)):
+    # metrics_arr is already global
+    metrics_arr.clear() # Clear if running multiple times in a session
 
-        print('running split:', fold+1)
+    for fold_idx, (train_idx, test_idx) in enumerate(kf.split(full_dataset)):
+        current_fold_num = fold_idx + 1
+        print(f'========== Running Fold {current_fold_num}/{folds} ==========')
 
-        train_dataset = Subset(dataset, train_idx)
-        test_dataset = Subset(dataset, test_idx)
+        train_subset = Subset(full_dataset, train_idx)
+        test_subset = Subset(full_dataset, test_idx)
 
-        traindata_loader = DataLoader(dataset=train_dataset, batch_size=p.batch_size, shuffle=True, drop_last=True)
-        testdata_loader = DataLoader(dataset=test_dataset, batch_size=p.batch_size, shuffle=False, drop_last=True)
+        traindata_loader = DataLoader(dataset=train_subset, batch_size=p.batch_size, shuffle=True, drop_last=True)
+        testdata_loader = DataLoader(dataset=test_subset, batch_size=p.batch_size, shuffle=False, drop_last=True)
 
-        train_eval(traindata_loader, testdata_loader)
+        # Pass traindata_loader, testdata_loader, and current_fold_num
+        train_eval(traindata_loader, testdata_loader, current_fold_num)
 
-    print(f"All best APs: {', '.join(map(str, metrics_arr))}")
-    print(f"average AP: {sum(metrics_arr) / folds}")
-    
+    print(f"========== Cross-Validation Summary ==========")
+    if metrics_arr:
+        print(f"All best APs per fold: {', '.join(map(lambda x: f'{x:.4f}', metrics_arr))}")
+        print(f"Average AP over {folds} folds: {sum(metrics_arr) / len(metrics_arr):.4f}")
+    else:
+        print("No metrics recorded.")
